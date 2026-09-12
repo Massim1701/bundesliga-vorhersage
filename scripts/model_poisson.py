@@ -4,13 +4,21 @@ Poisson-Modell fuer die naechsten anstehenden Spiele.
 Kernidee je Begegnung:
 1. Direkter Vergleich (Head-to-Head) der letzten 5 Jahre zwischen genau diesen
    beiden Teams wird ermittelt und zu 50% in die Tor-Erwartung eingerechnet.
-   (Aktuell nur 1. Bundesliga-Daten vorhanden -- 2./3. Liga-Duelle fehlen noch,
-   da diese Ligen bisher nicht importiert wurden.)
+   Deckt 1. Bundesliga sowie Duelle in 2./3. Liga ab, sofern beide Teams
+   aktuell in der 1. Liga spielen (z.B. wenn ein Team zwischenzeitlich
+   abgestiegen war). Vollstaendige 2./3.-Liga-Historie fuer alle jemals
+   dort aktiven Teams ist nicht importiert -- nur die fuer aktuelle
+   Erstliga-Paarungen relevanten Duelle.
 2. Gab es in den letzten 5 Jahren KEIN Duell dieser beiden Teams, wird statt des
    langfristigen 2-Saison-Schnitts die aktuelle Formstaerke (nur laufende Saison)
    verwendet, um moeglichst nah am jetzigen Kader zu bleiben.
 3. Fehlende Stammspieler (laut Aufstellung, gemessen an Torbeteiligung der
    laufenden Saison) werten die Angriffs-/Abwehrstaerke leicht ab.
+4. Wo Expected-Goals (xG) von Understat vorliegen (Spalten xg_heim/xg_gast),
+   fliessen sie zu 50% in die Tor-Rate pro Spiel mit ein (sowohl in die
+   allgemeine Team-Staerke als auch in den H2H-Vergleich). xG glaettet
+   Zufallsspitzen (ein abgefaelschter Distanzschuss zaehlt torstatistisch wie
+   ein Elfmeter) und macht die Einschaetzung bei kleinen Stichproben robuster.
 
 Nutzung:
   python model_poisson.py --tage-voraus 3
@@ -31,7 +39,7 @@ HEIMVORTEIL = 1.15  # grober Faktor, spaeter aus Daten ableitbar
 PLAYER_WEIGHT = 0.06  # Abwertung Angriffs-/Abwehrstaerke je fehlendem Top-Scorer
 H2H_JAHRE = 5  # Betrachtungszeitraum fuer den direkten Vergleich
 H2H_GEWICHT = 0.5  # Anteil des direkten Vergleichs an der Tor-Erwartung
-MODELL_VERSION = "poisson_v2_h2h"
+MODELL_VERSION = "poisson_v3_xg"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -39,7 +47,7 @@ sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 def liga_kennzahlen(saisons: list[str]):
     spiele = (
         sb.table("spiele")
-        .select("heim_team_id, gast_team_id, tore_heim, tore_gast")
+        .select("heim_team_id, gast_team_id, tore_heim, tore_gast, xg_heim, xg_gast")
         .in_("saison", saisons)
         .not_.is_("tore_heim", "null")
         .execute()
@@ -52,11 +60,16 @@ def liga_kennzahlen(saisons: list[str]):
     for s in spiele:
         gesamt_tore += s["tore_heim"] + s["tore_gast"]
         gesamt_spiele += 1
+        # Wenn xG vorhanden ist, wird sie zu 50% mit den echten Toren geblendet.
+        # xG glaettet Zufallsspitzen (Glueck/Pech vor dem Tor) und macht die
+        # Staerke-Einschaetzung gerade bei kleinen Stichproben robuster.
+        eff_heim = s["tore_heim"] if s.get("xg_heim") is None else 0.5 * s["tore_heim"] + 0.5 * s["xg_heim"]
+        eff_gast = s["tore_gast"] if s.get("xg_gast") is None else 0.5 * s["tore_gast"] + 0.5 * s["xg_gast"]
         for team_id, geschossen, kassiert in (
-            (s["heim_team_id"], s["tore_heim"], s["tore_gast"]),
-            (s["gast_team_id"], s["tore_gast"], s["tore_heim"]),
+            (s["heim_team_id"], eff_heim, eff_gast),
+            (s["gast_team_id"], eff_gast, eff_heim),
         ):
-            t = team_stats.setdefault(team_id, {"spiele": 0, "tore": 0, "gegentore": 0})
+            t = team_stats.setdefault(team_id, {"spiele": 0, "tore": 0.0, "gegentore": 0.0})
             t["spiele"] += 1
             t["tore"] += geschossen
             t["gegentore"] += kassiert
@@ -83,7 +96,7 @@ def h2h_erwartung(heim_id: int, gast_id: int, aktuelle_saison: str):
 
     hin = (
         sb.table("spiele")
-        .select("tore_heim, tore_gast, saison")
+        .select("tore_heim, tore_gast, xg_heim, xg_gast, saison")
         .eq("heim_team_id", heim_id)
         .eq("gast_team_id", gast_id)
         .gte("saison", ab_saison)
@@ -93,7 +106,7 @@ def h2h_erwartung(heim_id: int, gast_id: int, aktuelle_saison: str):
     )
     rueck = (
         sb.table("spiele")
-        .select("tore_heim, tore_gast, saison")
+        .select("tore_heim, tore_gast, xg_heim, xg_gast, saison")
         .eq("heim_team_id", gast_id)
         .eq("gast_team_id", heim_id)
         .gte("saison", ab_saison)
@@ -106,8 +119,15 @@ def h2h_erwartung(heim_id: int, gast_id: int, aktuelle_saison: str):
     if anzahl == 0:
         return None
 
-    heim_tore = sum(s["tore_heim"] for s in hin) + sum(s["tore_gast"] for s in rueck)
-    gast_tore = sum(s["tore_gast"] for s in hin) + sum(s["tore_heim"] for s in rueck)
+    def eff(tore, xg):
+        return tore if xg is None else 0.5 * tore + 0.5 * xg
+
+    heim_tore = sum(eff(s["tore_heim"], s.get("xg_heim")) for s in hin) + sum(
+        eff(s["tore_gast"], s.get("xg_gast")) for s in rueck
+    )
+    gast_tore = sum(eff(s["tore_gast"], s.get("xg_gast")) for s in hin) + sum(
+        eff(s["tore_heim"], s.get("xg_heim")) for s in rueck
+    )
     return heim_tore / anzahl, gast_tore / anzahl, anzahl
 
 
