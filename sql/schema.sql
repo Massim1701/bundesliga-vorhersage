@@ -1,0 +1,5 @@
+-- Referenz-Backup des in Supabase live angewendeten Schemas.
+-- Aenderungen bitte ueber Supabase-Migrationen machen, nicht direkt hier.
+-- Volles Schema (Tabellen teams, spiele, spieler, spieler_statistiken,
+-- aufstellungen, vorhersagen + View abgleich) ist live im Supabase-Projekt
+-- bundesliga-vorhersage appliziert.
