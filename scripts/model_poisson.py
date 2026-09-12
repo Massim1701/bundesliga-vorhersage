@@ -32,6 +32,13 @@ Kernidee je Begegnung:
    systematisch knappe/torarme Ergebnisse (0:0, 1:0, 0:1, 1:1). Ein kleiner
    Korrekturfaktor (RHO, Literaturwert ca. -0.13) gleicht das direkt in der
    Ergebnis-Wahrscheinlichkeitsmatrix aus.
+7. Toranalyse nach Spielminute (Tabelle "tore", pro Tor mit exakter Minute
+   via OpenLigaDB): Teams, die ueberproportional viele ihrer Tore/Gegentore
+   erst ab der 75. Minute kassieren bzw. schiessen, zeigen ein Fitness-/
+   Konzentrationsmuster -- nachlassende Physis in der Schlussphase fuehrt zu
+   Abwehrfehlern, frische Beine auf der Bank koennen umgekehrt spaete Tore
+   begnstigen. Die Abweichung vom Liga-Durchschnitt dieser Spaetphasen-Quote
+   fliesst als zusaetzlicher Faktor in Angriffs-/Abwehrstaerke ein.
 
 Nutzung:
   python model_poisson.py --tage-voraus 3
@@ -57,9 +64,32 @@ KADERWERT_GEWICHT = 0.15  # Einfluss der Kaderwert-Differenz auf die Angriffssta
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
-MODELL_VERSION = "poisson_v5_dixoncoles"
+SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
+KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
+MODELL_VERSION = "poisson_v6_konzentration"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def fetch_all_paginiert(query_builder):
+    """
+    Supabase/PostgREST deckelt Anfragen serverseitig auf 1000 Zeilen, auch
+    bei explizit gesetztem hoeherem limit. Ohne Pagination wuerden groessere
+    Zeitfenster (z.B. liga_kennzahlen_zeitgewichtet, liga_konzentration)
+    still und leise abgeschnitten. query_builder ist eine Funktion, die bei
+    jedem Aufruf eine frische Query liefert (Supabase-Query-Objekte sind
+    nur einmal nutzbar), auf die .range() angewendet wird.
+    """
+    alle = []
+    offset = 0
+    seiten_groesse = 1000
+    while True:
+        seite = query_builder().range(offset, offset + seiten_groesse - 1).execute().data
+        alle.extend(seite)
+        if len(seite) < seiten_groesse:
+            break
+        offset += seiten_groesse
+    return alle
 
 
 def liga_kennzahlen_zeitgewichtet(bis_datum: datetime):
@@ -70,16 +100,14 @@ def liga_kennzahlen_zeitgewichtet(bis_datum: datetime):
     kontinuierlich statt abrupt an einer Saison-Grenze zu kippen.
     """
     ab_datum = bis_datum - timedelta(days=365 * STAERKE_JAHRE)
-    spiele = (
+    spiele = fetch_all_paginiert(lambda: (
         sb.table("spiele")
         .select("heim_team_id, gast_team_id, tore_heim, tore_gast, xg_heim, xg_gast, anstoss")
         .eq("liga", "bl1")
         .gte("anstoss", ab_datum.isoformat())
         .lt("anstoss", bis_datum.isoformat())
         .not_.is_("tore_heim", "null")
-        .execute()
-        .data
-    )
+    ))
 
     team_stats = {}
     gesamt_tore_w, gesamt_gewicht_spiele = 0.0, 0.0
@@ -244,6 +272,65 @@ def kaderwert_faktoren(heim_id: int, gast_id: int) -> tuple[float, float]:
     return 1 + delta, 1 - delta
 
 
+def liga_konzentration(bis_datum: datetime):
+    """
+    Analysiert fuer jedes Team, wie viele seiner Tore/Gegentore in der
+    Spaetphase (ab SPAETPHASE_MINUTE) fallen -- ein Hinweis auf Fitness und
+    Konzentration in den Schlussminuten. Vergleich gegen den Liga-Schnitt
+    ergibt pro Team einen Angriffs- und einen Abwehr-Korrekturfaktor.
+    Nutzt dasselbe Zeitfenster wie liga_kennzahlen_zeitgewichtet.
+    """
+    ab_datum = bis_datum - timedelta(days=365 * STAERKE_JAHRE)
+    tore = fetch_all_paginiert(lambda: (
+        sb.table("tore")
+        .select("team_id, minute, spiele!inner(heim_team_id, gast_team_id, anstoss, liga)")
+        .gte("spiele.anstoss", ab_datum.isoformat())
+        .lt("spiele.anstoss", bis_datum.isoformat())
+        .eq("spiele.liga", "bl1")
+    ))
+
+    stats = {}
+
+    def eintrag(team_id):
+        return stats.setdefault(team_id, {"tore": 0, "tore_spaet": 0, "gegentore": 0, "gegentore_spaet": 0})
+
+    for t in tore:
+        spiel = t["spiele"]
+        heim, gast = spiel["heim_team_id"], spiel["gast_team_id"]
+        schuetze = t["team_id"]
+        gegner = gast if schuetze == heim else heim
+        spaet = t["minute"] is not None and t["minute"] >= SPAETPHASE_MINUTE
+
+        s = eintrag(schuetze)
+        s["tore"] += 1
+        if spaet:
+            s["tore_spaet"] += 1
+
+        g = eintrag(gegner)
+        g["gegentore"] += 1
+        if spaet:
+            g["gegentore_spaet"] += 1
+
+    # Liga-Durchschnitt der Spaetphasen-Quoten (mindestens etwas Datenbasis pro Team gefordert)
+    tore_quoten = [s["tore_spaet"] / s["tore"] for s in stats.values() if s["tore"] >= 15]
+    gegentore_quoten = [s["gegentore_spaet"] / s["gegentore"] for s in stats.values() if s["gegentore"] >= 15]
+    liga_tore_quote = sum(tore_quoten) / len(tore_quoten) if tore_quoten else None
+    liga_gegentore_quote = sum(gegentore_quoten) / len(gegentore_quoten) if gegentore_quoten else None
+
+    faktoren = {}
+    for team_id, s in stats.items():
+        angriff_faktor = 1.0
+        abwehr_faktor = 1.0
+        if liga_tore_quote is not None and s["tore"] >= 15:
+            quote = s["tore_spaet"] / s["tore"]
+            angriff_faktor = 1 + KONZENTRATION_GEWICHT * (quote - liga_tore_quote)
+        if liga_gegentore_quote is not None and s["gegentore"] >= 15:
+            quote = s["gegentore_spaet"] / s["gegentore"]
+            abwehr_faktor = 1 + KONZENTRATION_GEWICHT * (quote - liga_gegentore_quote)
+        faktoren[team_id] = (angriff_faktor, abwehr_faktor)
+    return faktoren
+
+
 def matrix_vorhersage(
     erw_heim: float, erw_gast: float, max_tore: int = 6):
     p_heim = p_unentschieden = p_gast = 0.0
@@ -277,6 +364,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
     bis = jetzt + timedelta(days=tage_voraus)
 
     staerken, liga_avg = liga_kennzahlen_zeitgewichtet(jetzt)
+    konzentration = liga_konzentration(jetzt)
 
     spiele = (
         sb.table("spiele")
@@ -312,6 +400,13 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         kw_faktor_heim, kw_faktor_gast = kaderwert_faktoren(heim, gast)
         angriff_heim *= kw_faktor_heim
         angriff_gast *= kw_faktor_gast
+
+        kz_angriff_heim, kz_abwehr_heim = konzentration.get(heim, (1.0, 1.0))
+        kz_angriff_gast, kz_abwehr_gast = konzentration.get(gast, (1.0, 1.0))
+        angriff_heim *= kz_angriff_heim
+        angriff_gast *= kz_angriff_gast
+        abwehr_heim *= kz_abwehr_heim
+        abwehr_gast *= kz_abwehr_gast
 
         erw_heim = avg * angriff_heim * abwehr_gast * HEIMVORTEIL
         erw_gast = avg * angriff_gast * abwehr_heim
