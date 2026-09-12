@@ -9,9 +9,14 @@ Kernidee je Begegnung:
    abgestiegen war). Vollstaendige 2./3.-Liga-Historie fuer alle jemals
    dort aktiven Teams ist nicht importiert -- nur die fuer aktuelle
    Erstliga-Paarungen relevanten Duelle.
-2. Gab es in den letzten 5 Jahren KEIN Duell dieser beiden Teams, wird statt des
-   langfristigen 2-Saison-Schnitts die aktuelle Formstaerke (nur laufende Saison)
-   verwendet, um moeglichst nah am jetzigen Kader zu bleiben.
+2. Team-Staerke (Angriff/Abwehr) wird nicht mehr starr zwischen "2-Saison-
+   Schnitt" und "nur aktuelle Saison" umgeschaltet, sondern durchgehend
+   nach Dixon-Coles (1997) zeitgewichtet: jedes Spiel geht mit dem Gewicht
+   exp(-XI * Tage_seit_Anpfiff) in die Staerke-Berechnung ein. XI=0.0065
+   pro halber Woche (Originalwert aus dem Paper) heisst: ein Spiel von vor
+   107 Tagen zaehlt nur noch halb so viel wie eines von gestern. Das bildet
+   Kaderwechsel, Trainerwechsel und Formschwankungen automatisch ab, ohne
+   dass man dafuer eine harte Saison-Grenze ziehen muss.
 3. Fehlende Stammspieler (laut Aufstellung, gemessen an Torbeteiligung der
    laufenden Saison) werten die Angriffs-/Abwehrstaerke leicht ab.
 4. Wo Expected-Goals (xG) von Understat vorliegen (Spalten xg_heim/xg_gast),
@@ -23,6 +28,10 @@ Kernidee je Begegnung:
    als zusaetzlicher, logarithmisch skalierter Faktor in die Angriffsstaerke
    ein -- der teurere Kader gewinnt historisch ueberproportional oft
    (siehe FC Bayern), daher wird das explizit mitgewichtet.
+6. Dixon-Coles Tau-Korrektur: die unabhaengige Poisson-Annahme unterschaetzt
+   systematisch knappe/torarme Ergebnisse (0:0, 1:0, 0:1, 1:1). Ein kleiner
+   Korrekturfaktor (RHO, Literaturwert ca. -0.13) gleicht das direkt in der
+   Ergebnis-Wahrscheinlichkeitsmatrix aus.
 
 Nutzung:
   python model_poisson.py --tage-voraus 3
@@ -45,50 +54,80 @@ PLAYER_WEIGHT = 0.06  # Abwertung Angriffs-/Abwehrstaerke je fehlendem Top-Score
 H2H_JAHRE = 5  # Betrachtungszeitraum fuer den direkten Vergleich
 H2H_GEWICHT = 0.5  # Anteil des direkten Vergleichs an der Tor-Erwartung
 KADERWERT_GEWICHT = 0.15  # Einfluss der Kaderwert-Differenz auf die Angriffsstaerke
-MODELL_VERSION = "poisson_v4_kaderwert"
+XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
+RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
+STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
+MODELL_VERSION = "poisson_v5_dixoncoles"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def liga_kennzahlen(saisons: list[str]):
+def liga_kennzahlen_zeitgewichtet(bis_datum: datetime):
+    """
+    Ersetzt die alte starre "2-Saison-Schnitt vs. aktuelle Saison"-Umschaltung
+    durch eine durchgehende Dixon-Coles-Zeitgewichtung: jedes Spiel zaehlt mit
+    exp(-XI * Tage_seit_Anpfiff), also verblasst der Einfluss eines Spiels
+    kontinuierlich statt abrupt an einer Saison-Grenze zu kippen.
+    """
+    ab_datum = bis_datum - timedelta(days=365 * STAERKE_JAHRE)
     spiele = (
         sb.table("spiele")
-        .select("heim_team_id, gast_team_id, tore_heim, tore_gast, xg_heim, xg_gast")
-        .in_("saison", saisons)
+        .select("heim_team_id, gast_team_id, tore_heim, tore_gast, xg_heim, xg_gast, anstoss")
+        .eq("liga", "bl1")
+        .gte("anstoss", ab_datum.isoformat())
+        .lt("anstoss", bis_datum.isoformat())
         .not_.is_("tore_heim", "null")
         .execute()
         .data
     )
 
     team_stats = {}
-    gesamt_tore, gesamt_spiele = 0, 0
+    gesamt_tore_w, gesamt_gewicht_spiele = 0.0, 0.0
 
     for s in spiele:
-        gesamt_tore += s["tore_heim"] + s["tore_gast"]
-        gesamt_spiele += 1
-        # Wenn xG vorhanden ist, wird sie zu 50% mit den echten Toren geblendet.
-        # xG glaettet Zufallsspitzen (Glueck/Pech vor dem Tor) und macht die
-        # Staerke-Einschaetzung gerade bei kleinen Stichproben robuster.
+        anstoss = datetime.fromisoformat(s["anstoss"].replace("Z", "+00:00"))
+        tage_her = max((bis_datum - anstoss).days, 0)
+        gewicht = math.exp(-XI * tage_her)
+
         eff_heim = s["tore_heim"] if s.get("xg_heim") is None else 0.5 * s["tore_heim"] + 0.5 * s["xg_heim"]
         eff_gast = s["tore_gast"] if s.get("xg_gast") is None else 0.5 * s["tore_gast"] + 0.5 * s["xg_gast"]
+
+        gesamt_tore_w += gewicht * (eff_heim + eff_gast)
+        gesamt_gewicht_spiele += gewicht
+
         for team_id, geschossen, kassiert in (
             (s["heim_team_id"], eff_heim, eff_gast),
             (s["gast_team_id"], eff_gast, eff_heim),
         ):
-            t = team_stats.setdefault(team_id, {"spiele": 0, "tore": 0.0, "gegentore": 0.0})
-            t["spiele"] += 1
-            t["tore"] += geschossen
-            t["gegentore"] += kassiert
+            t = team_stats.setdefault(team_id, {"gewicht": 0.0, "tore_w": 0.0, "gegentore_w": 0.0})
+            t["gewicht"] += gewicht
+            t["tore_w"] += gewicht * geschossen
+            t["gegentore_w"] += gewicht * kassiert
 
-    liga_avg = gesamt_tore / gesamt_spiele / 2 if gesamt_spiele else 1.3
+    liga_avg = gesamt_tore_w / gesamt_gewicht_spiele / 2 if gesamt_gewicht_spiele else 1.3
 
     staerken = {}
     for team_id, t in team_stats.items():
+        if t["gewicht"] <= 0:
+            continue
         staerken[team_id] = {
-            "angriff": (t["tore"] / t["spiele"]) / liga_avg,
-            "abwehr": (t["gegentore"] / t["spiele"]) / liga_avg,
+            "angriff": (t["tore_w"] / t["gewicht"]) / liga_avg,
+            "abwehr": (t["gegentore_w"] / t["gewicht"]) / liga_avg,
         }
     return staerken, liga_avg
+
+
+def tau_korrektur(x: int, y: int, lam: float, mu: float, rho: float) -> float:
+    """Dixon-Coles Korrekturfaktor fuer knappe/torarme Ergebnisse (0:0, 1:0, 0:1, 1:1)."""
+    if x == 0 and y == 0:
+        return 1 - lam * mu * rho
+    if x == 0 and y == 1:
+        return 1 + lam * rho
+    if x == 1 and y == 0:
+        return 1 + mu * rho
+    if x == 1 and y == 1:
+        return 1 - rho
+    return 1.0
 
 
 def h2h_erwartung(heim_id: int, gast_id: int, aktuelle_saison: str):
@@ -213,6 +252,7 @@ def matrix_vorhersage(
     for h in range(max_tore + 1):
         for g in range(max_tore + 1):
             p = poisson.pmf(h, erw_heim) * poisson.pmf(g, erw_gast)
+            p *= tau_korrektur(h, g, erw_heim, erw_gast, RHO)
             if p > beste_wkeit:
                 beste_wkeit, bestes_ergebnis = p, (h, g)
             if h > g:
@@ -222,17 +262,21 @@ def matrix_vorhersage(
             else:
                 p_gast += p
 
+    # Normierung: die Tau-Korrektur verschiebt nur torarme Ergebnisse,
+    # kann die Summe aber minimal von 1 wegbewegen.
+    gesamt = p_heim + p_unentschieden + p_gast
+    if gesamt > 0:
+        p_heim, p_unentschieden, p_gast = p_heim / gesamt, p_unentschieden / gesamt, p_gast / gesamt
+
     return p_heim, p_unentschieden, p_gast, bestes_ergebnis
 
 
 def berechne_vorhersagen(tage_voraus: int = 3):
     aktuelle_saison = str(datetime.now().year)
-    vorjahr = str(int(aktuelle_saison) - 1)
-    staerken_2j, liga_avg = liga_kennzahlen([vorjahr, aktuelle_saison])
-    staerken_aktuell, liga_avg_aktuell = liga_kennzahlen([aktuelle_saison])
-
     jetzt = datetime.now(timezone.utc)
     bis = jetzt + timedelta(days=tage_voraus)
+
+    staerken, liga_avg = liga_kennzahlen_zeitgewichtet(jetzt)
 
     spiele = (
         sb.table("spiele")
@@ -249,22 +293,16 @@ def berechne_vorhersagen(tage_voraus: int = 3):
 
         h2h = h2h_erwartung(heim, gast, aktuelle_saison)
 
-        if h2h is None and heim in staerken_aktuell and gast in staerken_aktuell:
-            # Kein Duell in den letzten 5 Jahren -> aktuelle Formstaerke (nur
-            # laufende Saison) statt langfristigem 2-Saison-Schnitt verwenden.
-            staerken, avg = staerken_aktuell, liga_avg_aktuell
-            basis = "aktuelle Formstaerke (kein H2H in 5 Jahren)"
-        elif heim in staerken_2j and gast in staerken_2j:
-            staerken, avg = staerken_2j, liga_avg
-            basis = "2-Saison-Schnitt" + (" + H2H" if h2h else "")
-        else:
+        if heim not in staerken or gast not in staerken:
             print(f"Spiel {spiel['id']}: nicht genug Historie, uebersprungen.")
             continue
+        basis = "zeitgewichtete Staerke (Dixon-Coles)" + (" + H2H" if h2h else "")
 
         angriff_heim = staerken[heim]["angriff"]
         abwehr_heim = staerken[heim]["abwehr"]
         angriff_gast = staerken[gast]["angriff"]
         abwehr_gast = staerken[gast]["abwehr"]
+        avg = liga_avg
 
         fehlt_heim = fehlende_stammspieler(spiel["id"], heim, aktuelle_saison)
         fehlt_gast = fehlende_stammspieler(spiel["id"], gast, aktuelle_saison)
