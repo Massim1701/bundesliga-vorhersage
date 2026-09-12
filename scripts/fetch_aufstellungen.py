@@ -1,13 +1,21 @@
 """
-Zwei Aufgaben ueber die API-Football (https://www.api-football.com/, kostenloser
+Aufgaben ueber die API-Football (https://www.api-football.com/, kostenloser
 Tier reicht fuer eine Liga/Tag):
 
-1. --stats     Aktualisiert Saison-Statistiken (Tore, Vorlagen, Karten) je Spieler.
-2. --lineups   Prueft anstehende Spiele der naechsten 2 Stunden und zieht,
-               sobald verfuegbar, die Aufstellung (idR ~1h vor Anpfiff online).
+1. --stats               Aktualisiert Saison-Statistiken (Tore, Vorlagen, Karten) je Spieler.
+2. --lineups              Prueft anstehende Spiele der naechsten 2 Stunden und zieht,
+                          sobald verfuegbar, die BESTAETIGTE Aufstellung (idR ~1h vor
+                          Anpfiff online). Ueberschreibt eine evtl. vorhandene vorlaeufige.
+3. --vorlaeufige-aufstellung  Fuer Spiele der naechsten Tage (noch keine bestaetigte
+                          Aufstellung): nimmt je Team die Startelf aus dessen letztem
+                          abgeschlossenen Spiel als Annaeherung (Trainer wechseln die
+                          Startelf selten komplett) und speichert sie mit
+                          quelle='letzter_spieltag'. Wird von --lineups spaeter automatisch
+                          durch die echte, bestaetigte Aufstellung ersetzt.
 
 In GitHub Actions per Cron mehrfach am Spieltag laufen lassen (siehe
-.github/workflows/spieltag.yml), damit die Aufstellung zeitnah erfasst wird.
+.github/workflows/spieltag.yml): --vorlaeufige-aufstellung taeglich im Voraus,
+--lineups stuendlich rund um die Anstosszeiten.
 """
 import argparse
 import os
@@ -103,11 +111,95 @@ def sync_lineups():
                             "spieler_id": spieler[0]["id"],
                             "startelf": ist_startelf,
                             "position": entry["player"].get("pos"),
+                            "quelle": "bestaetigt",
                         },
                         on_conflict="spiel_id,spieler_id",
                     ).execute()
 
-        print(f"Spiel {spiel['id']}: Aufstellung gespeichert.")
+        print(f"Spiel {spiel['id']}: bestaetigte Aufstellung gespeichert (ersetzt vorlaeufige).")
+
+
+def sync_vorlaeufige_aufstellung(tage_voraus: int = 6):
+    """
+    Setzt fuer anstehende Spiele (noch keine bestaetigte Aufstellung) je Team die
+    Startelf aus dessen letztem abgeschlossenen Spiel als Annaeherung ein. Wird
+    automatisch durch die echte Aufstellung ueberschrieben, sobald --lineups sie
+    ~1h vor Anpfiff findet.
+    """
+    jetzt = datetime.now(timezone.utc)
+    bis = jetzt + timedelta(days=tage_voraus)
+
+    anstehende = (
+        sb.table("spiele")
+        .select("id, heim_team_id, gast_team_id, anstoss")
+        .gte("anstoss", jetzt.isoformat())
+        .lte("anstoss", bis.isoformat())
+        .eq("status", "geplant")
+        .execute()
+        .data
+    )
+
+    for spiel in anstehende:
+        # Falls schon eine bestaetigte Aufstellung existiert, nichts tun.
+        vorhanden = (
+            sb.table("aufstellungen")
+            .select("id")
+            .eq("spiel_id", spiel["id"])
+            .eq("quelle", "bestaetigt")
+            .limit(1)
+            .execute()
+            .data
+        )
+        if vorhanden:
+            continue
+
+        for team_id in (spiel["heim_team_id"], spiel["gast_team_id"]):
+            team = sb.table("teams").select("api_football_id, name").eq("id", team_id).execute().data
+            if not team or not team[0]["api_football_id"]:
+                continue
+            api_team_id = team[0]["api_football_id"]
+
+            letzte = requests.get(
+                f"{BASE}/fixtures",
+                headers=HEADERS,
+                params={"team": api_team_id, "last": 1},
+                timeout=20,
+            ).json()
+            if not letzte.get("response"):
+                continue
+            letztes_fixture_id = letzte["response"][0]["fixture"]["id"]
+
+            lineup = requests.get(
+                f"{BASE}/fixtures/lineups",
+                headers=HEADERS,
+                params={"fixture": letztes_fixture_id},
+                timeout=20,
+            ).json()
+
+            for team_lineup in lineup.get("response", []):
+                for entry in team_lineup.get("startXI", []):
+                    spieler_name = entry["player"]["name"]
+                    spieler = (
+                        sb.table("spieler")
+                        .select("id")
+                        .ilike("name", f"%{spieler_name}%")
+                        .limit(1)
+                        .execute()
+                        .data
+                    )
+                    if not spieler:
+                        continue
+                    sb.table("aufstellungen").upsert(
+                        {
+                            "spiel_id": spiel["id"],
+                            "spieler_id": spieler[0]["id"],
+                            "startelf": True,
+                            "position": entry["player"].get("pos"),
+                            "quelle": "letzter_spieltag",
+                        },
+                        on_conflict="spiel_id,spieler_id",
+                    ).execute()
+            print(f"Spiel {spiel['id']}: vorlaeufige Aufstellung ({team[0]['name']}) aus letztem Spiel uebernommen.")
 
 
 def sync_stats(saison: str):
@@ -155,11 +247,14 @@ def _spieler_id(name: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--lineups", action="store_true")
+    parser.add_argument("--vorlaeufige-aufstellung", action="store_true")
     parser.add_argument("--stats", action="store_true")
     parser.add_argument("--saison", default=str(datetime.now().year))
     args = parser.parse_args()
 
     if args.lineups:
         sync_lineups()
+    if args.vorlaeufige_aufstellung:
+        sync_vorlaeufige_aufstellung()
     if args.stats:
         sync_stats(args.saison)
