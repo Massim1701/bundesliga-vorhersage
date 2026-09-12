@@ -19,11 +19,16 @@ Kernidee je Begegnung:
    allgemeine Team-Staerke als auch in den H2H-Vergleich). xG glaettet
    Zufallsspitzen (ein abgefaelschter Distanzschuss zaehlt torstatistisch wie
    ein Elfmeter) und macht die Einschaetzung bei kleinen Stichproben robuster.
+5. Der Gesamt-Kaderwert (Transfermarkt-Basis, teams.kaderwert_euro) fliesst
+   als zusaetzlicher, logarithmisch skalierter Faktor in die Angriffsstaerke
+   ein -- der teurere Kader gewinnt historisch ueberproportional oft
+   (siehe FC Bayern), daher wird das explizit mitgewichtet.
 
 Nutzung:
   python model_poisson.py --tage-voraus 3
 """
 import argparse
+import math
 from datetime import datetime, timedelta, timezone
 import os
 
@@ -39,7 +44,8 @@ HEIMVORTEIL = 1.15  # grober Faktor, spaeter aus Daten ableitbar
 PLAYER_WEIGHT = 0.06  # Abwertung Angriffs-/Abwehrstaerke je fehlendem Top-Scorer
 H2H_JAHRE = 5  # Betrachtungszeitraum fuer den direkten Vergleich
 H2H_GEWICHT = 0.5  # Anteil des direkten Vergleichs an der Tor-Erwartung
-MODELL_VERSION = "poisson_v3_xg"
+KADERWERT_GEWICHT = 0.15  # Einfluss der Kaderwert-Differenz auf die Angriffsstaerke
+MODELL_VERSION = "poisson_v4_kaderwert"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -164,7 +170,43 @@ def fehlende_stammspieler(spiel_id: int, team_id: int, saison: str) -> int:
     return len(top - im_kader)
 
 
-def matrix_vorhersage(erw_heim: float, erw_gast: float, max_tore: int = 6):
+def kaderwert(team_id: int) -> int | None:
+    """
+    Gesamt-Kaderwert des Teams in Euro (Transfermarkt-Basis, aktuell manuell
+    gepflegt in teams.kaderwert_euro, solange die transfermarkt-api-Instanz
+    nicht zuverlaessig laeuft). Teurere Kader gewinnen historisch deutlich
+    haeufiger -- siehe z.B. FC Bayern -- daher fliesst der Wert zusaetzlich
+    zu Form/H2H mit ein.
+    """
+    res = (
+        sb.table("teams")
+        .select("kaderwert_euro")
+        .eq("id", team_id)
+        .single()
+        .execute()
+        .data
+    )
+    return res.get("kaderwert_euro") if res else None
+
+
+def kaderwert_faktoren(heim_id: int, gast_id: int) -> tuple[float, float]:
+    """
+    Wandelt das Verhaeltnis der Kaderwerte in zwei multiplikative Faktoren
+    fuer die Angriffsstaerke um. Logarithmisch skaliert, damit ein
+    Bayern-vs-Elversberg-Verhaeltnis (Faktor ~19) die Vorhersage nicht
+    komplett sprengt, aber trotzdem spuerbar reinschlaegt.
+    """
+    mw_heim = kaderwert(heim_id)
+    mw_gast = kaderwert(gast_id)
+    if not mw_heim or not mw_gast:
+        return 1.0, 1.0
+    verhaeltnis = math.log(mw_heim / mw_gast)
+    delta = KADERWERT_GEWICHT * math.tanh(verhaeltnis / 2)
+    return 1 + delta, 1 - delta
+
+
+def matrix_vorhersage(
+    erw_heim: float, erw_gast: float, max_tore: int = 6):
     p_heim = p_unentschieden = p_gast = 0.0
     bestes_ergebnis, beste_wkeit = (0, 0), 0.0
 
@@ -229,6 +271,10 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         angriff_heim *= max(0.5, 1 - PLAYER_WEIGHT * fehlt_heim)
         angriff_gast *= max(0.5, 1 - PLAYER_WEIGHT * fehlt_gast)
 
+        kw_faktor_heim, kw_faktor_gast = kaderwert_faktoren(heim, gast)
+        angriff_heim *= kw_faktor_heim
+        angriff_gast *= kw_faktor_gast
+
         erw_heim = avg * angriff_heim * abwehr_gast * HEIMVORTEIL
         erw_gast = avg * angriff_gast * abwehr_heim
 
@@ -255,9 +301,10 @@ def berechne_vorhersagen(tage_voraus: int = 3):
             on_conflict="spiel_id",
         ).execute()
         h2h_info = f", H2H: {h2h[2]} Spiele" if h2h else ""
+        kw_info = f", Kaderwert-Faktor: {kw_faktor_heim:.2f}/{kw_faktor_gast:.2f}" if kw_faktor_heim != 1.0 else ""
         print(
             f"Spiel {spiel['id']}: Tipp {tipp_h}:{tipp_g} "
-            f"(H {p_heim:.0%} / U {p_x:.0%} / A {p_gast:.0%}) [{basis}{h2h_info}]"
+            f"(H {p_heim:.0%} / U {p_x:.0%} / A {p_gast:.0%}) [{basis}{h2h_info}{kw_info}]"
         )
 
 
