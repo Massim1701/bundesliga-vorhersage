@@ -69,12 +69,15 @@ TRAINERWECHSEL_FENSTER = (3, 10)  # Spiele seit Wechsel, in denen der Bonus grei
 TRAINER_QUALITAET_GEWICHT = 0.05  # bewusst klein -- nur Randnotiz, Trainer schiessen keine Tore
 TRAINER_QUALITAET_MIN_SPIELE = 10  # ohne genug Spiele unter diesem Trainer keine Aussage moeglich
 TRAINER_QUALITAET_JAHRE = 5  # Deckelung des Betrachtungszeitraums
+SCHIEDSRICHTER_GEWICHT = 0.1  # bewusst klein gehalten, generelle Tendenz nicht Team-spezifisch
+SCHIEDSRICHTER_MIN_SPIELE = 15  # ohne genug eigene Spiele keine verlaessliche Aussage
+LIGA_HEIMSIEG_QUOTE = 0.45  # grober Bundesliga-Erfahrungswert als Vergleichsbasis
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v9_trainerqualitaet"
+MODELL_VERSION = "poisson_v10_schiedsrichter"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -392,6 +395,29 @@ def trainer_qualitaet_faktor(team_id: int, bis_datum: datetime) -> tuple[float, 
     return 1 + delta, 1 - delta
 
 
+def schiedsrichter_heimvorteil_faktor(schiedsrichter: str | None) -> float:
+    """
+    Manche Schiedsrichter pfeifen im Schnitt heim-freundlicher oder
+    heim-feindlicher als der Durchschnitt (Elfmeter, Karten, Nachspielzeit).
+    Bewusst NICHT "Schiri X gegen Verein Y" (Stichprobe pro Paarung viel zu
+    klein, reines Zufallsrauschen), sondern die generelle Heimsieg-Quote
+    ueber ALLE von ihm geleiteten Bundesliga-Spiele. Schiedsrichter-Namen
+    werden aktuell manuell nachgetragen (spiele.schiedsrichter), da es keine
+    kostenlose automatisierte Ansetzungs-Quelle gibt. Ohne Namen oder ohne
+    genug Spiele: neutral.
+    """
+    if not schiedsrichter:
+        return 1.0
+    spiele = sb.table("spiele").select("tore_heim,tore_gast").eq("liga", "bl1") \
+        .eq("schiedsrichter", schiedsrichter).not_.is_("tore_heim", "null").execute().data
+    if len(spiele) < SCHIEDSRICHTER_MIN_SPIELE:
+        return 1.0
+    heimsiege = sum(1 for s in spiele if s["tore_heim"] > s["tore_gast"])
+    quote = heimsiege / len(spiele)
+    delta = SCHIEDSRICHTER_GEWICHT * math.tanh((quote - LIGA_HEIMSIEG_QUOTE) / LIGA_HEIMSIEG_QUOTE)
+    return 1 + delta
+
+
 def liga_konzentration(bis_datum: datetime):
     """
     Analysiert fuer jedes Team, wie viele seiner Tore/Gegentore in der
@@ -489,7 +515,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
 
     spiele = (
         sb.table("spiele")
-        .select("id, heim_team_id, gast_team_id, anstoss")
+        .select("id, heim_team_id, gast_team_id, anstoss, schiedsrichter")
         .gte("anstoss", sperrgrenze.isoformat())
         .lte("anstoss", bis.isoformat())
         .eq("status", "geplant")
@@ -550,7 +576,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         abwehr_heim *= kz_abwehr_heim
         abwehr_gast *= kz_abwehr_gast
 
-        erw_heim = avg * angriff_heim * abwehr_gast * HEIMVORTEIL
+        erw_heim = avg * angriff_heim * abwehr_gast * HEIMVORTEIL * schiedsrichter_heimvorteil_faktor(spiel.get("schiedsrichter"))
         erw_gast = avg * angriff_gast * abwehr_heim
 
         if h2h is not None:
