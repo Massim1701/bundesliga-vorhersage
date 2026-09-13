@@ -63,6 +63,7 @@ H2H_GEWICHT = 0.5  # Anteil des direkten Vergleichs an der Tor-Erwartung
 KADERWERT_GEWICHT = 0.15  # Einfluss der Kaderwert-Differenz auf die Angriffsstaerke
 FORM_ANZAHL_SPIELE = 5  # "the trend is your friend": ueber wie viele juengste Spiele die Form laeuft
 FORM_GEWICHT = 0.2  # wie stark die juengste Form vom langfristigen Saison-Schnitt abweichen darf
+SPERRFRIST_MINUTEN = 30  # ab wann vor Anstoss keine neue Vorhersage mehr berechnet wird
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
@@ -408,6 +409,7 @@ def matrix_vorhersage(
 def berechne_vorhersagen(tage_voraus: int = 3):
     aktuelle_saison = str(datetime.now().year)
     jetzt = datetime.now(timezone.utc)
+    sperrgrenze = jetzt + timedelta(minutes=SPERRFRIST_MINUTEN)
     bis = jetzt + timedelta(days=tage_voraus)
 
     staerken, liga_avg, form = liga_kennzahlen_zeitgewichtet(jetzt)
@@ -416,7 +418,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
     spiele = (
         sb.table("spiele")
         .select("id, heim_team_id, gast_team_id, anstoss")
-        .gte("anstoss", jetzt.isoformat())
+        .gte("anstoss", sperrgrenze.isoformat())
         .lte("anstoss", bis.isoformat())
         .eq("status", "geplant")
         .execute()
