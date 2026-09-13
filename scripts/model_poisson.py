@@ -66,12 +66,15 @@ FORM_GEWICHT = 0.2  # wie stark die juengste Form vom langfristigen Saison-Schni
 SPERRFRIST_MINUTEN = 30  # ab wann vor Anstoss keine neue Vorhersage mehr berechnet wird
 TRAINERWECHSEL_GEWICHT = 0.08  # kurzzeitiger Bonus im "neuer Besen"-Fenster
 TRAINERWECHSEL_FENSTER = (3, 10)  # Spiele seit Wechsel, in denen der Bonus greift (1-2 davor: neutral)
+TRAINER_QUALITAET_GEWICHT = 0.15  # max. Verschiebung durch ueberdurchschnittliche/-unterdurchschnittliche Punkte pro Spiel
+TRAINER_QUALITAET_MIN_SPIELE = 10  # ohne genug Spiele unter diesem Trainer keine Aussage moeglich
+TRAINER_QUALITAET_JAHRE = 5  # Deckelung des Betrachtungszeitraums
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v8_trainerwechsel"
+MODELL_VERSION = "poisson_v9_trainerqualitaet"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -349,6 +352,46 @@ def trainerwechsel_faktor(team_id: int, bis_datum: datetime) -> tuple[float, flo
     return 1.0, 1.0
 
 
+def trainer_qualitaet_faktor(team_id: int, bis_datum: datetime) -> tuple[float, float]:
+    """
+    Grundsaetzliche Trainer-Qualitaet, unabhaengig davon ob er neu ist oder
+    schon lange da: Punkte pro Spiel seit Amtsantritt bei DIESEM Verein,
+    gedeckelt auf die letzten TRAINER_QUALITAET_JAHRE Jahre. Vereinfachung
+    gegenueber einer echten Karriere-Bilanz ueber mehrere Stationen (dafuer
+    fehlt uns eine Trainer-Wechsel-Datenquelle mit Vereinshistorie) -- bei
+    Trainern, die schon laenger an ihrem aktuellen Klub sind, kommt es aufs
+    selbe raus. Ohne genug Spiele (z.B. gerade erst uebernommen) neutral.
+    """
+    res = sb.table("teams").select("trainer_seit").eq("id", team_id).single().execute().data
+    trainer_seit = res.get("trainer_seit") if res else None
+    if not trainer_seit:
+        return 1.0, 1.0
+
+    seit = datetime.fromisoformat(trainer_seit).replace(tzinfo=timezone.utc)
+    ab_datum = max(seit, bis_datum - timedelta(days=365 * TRAINER_QUALITAET_JAHRE))
+
+    heim = sb.table("spiele").select("tore_heim,tore_gast").eq("liga", "bl1").eq("heim_team_id", team_id) \
+        .gte("anstoss", ab_datum.isoformat()).lt("anstoss", bis_datum.isoformat()) \
+        .not_.is_("tore_heim", "null").execute().data
+    gast = sb.table("spiele").select("tore_heim,tore_gast").eq("liga", "bl1").eq("gast_team_id", team_id) \
+        .gte("anstoss", ab_datum.isoformat()).lt("anstoss", bis_datum.isoformat()) \
+        .not_.is_("tore_gast", "null").execute().data
+
+    n = len(heim) + len(gast)
+    if n < TRAINER_QUALITAET_MIN_SPIELE:
+        return 1.0, 1.0
+
+    punkte = 0
+    for s in heim:
+        punkte += 3 if s["tore_heim"] > s["tore_gast"] else 1 if s["tore_heim"] == s["tore_gast"] else 0
+    for s in gast:
+        punkte += 3 if s["tore_gast"] > s["tore_heim"] else 1 if s["tore_heim"] == s["tore_gast"] else 0
+
+    ppg = punkte / n
+    delta = TRAINER_QUALITAET_GEWICHT * math.tanh((ppg - 1.5) / 1.5)
+    return 1 + delta, 1 - delta
+
+
 def liga_konzentration(bis_datum: datetime):
     """
     Analysiert fuer jedes Team, wie viele seiner Tore/Gegentore in der
@@ -492,6 +535,13 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         angriff_gast *= tw_angriff_gast
         abwehr_heim *= tw_abwehr_heim
         abwehr_gast *= tw_abwehr_gast
+
+        tq_angriff_heim, tq_abwehr_heim = trainer_qualitaet_faktor(heim, jetzt)
+        tq_angriff_gast, tq_abwehr_gast = trainer_qualitaet_faktor(gast, jetzt)
+        angriff_heim *= tq_angriff_heim
+        angriff_gast *= tq_angriff_gast
+        abwehr_heim *= tq_abwehr_heim
+        abwehr_gast *= tq_abwehr_gast
 
         kz_angriff_heim, kz_abwehr_heim = konzentration.get(heim, (1.0, 1.0))
         kz_angriff_gast, kz_abwehr_gast = konzentration.get(gast, (1.0, 1.0))
