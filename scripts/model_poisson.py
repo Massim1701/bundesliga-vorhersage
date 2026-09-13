@@ -64,12 +64,14 @@ KADERWERT_GEWICHT = 0.15  # Einfluss der Kaderwert-Differenz auf die Angriffssta
 FORM_ANZAHL_SPIELE = 5  # "the trend is your friend": ueber wie viele juengste Spiele die Form laeuft
 FORM_GEWICHT = 0.2  # wie stark die juengste Form vom langfristigen Saison-Schnitt abweichen darf
 SPERRFRIST_MINUTEN = 30  # ab wann vor Anstoss keine neue Vorhersage mehr berechnet wird
+TRAINERWECHSEL_GEWICHT = 0.08  # kurzzeitiger Bonus im "neuer Besen"-Fenster
+TRAINERWECHSEL_FENSTER = (3, 10)  # Spiele seit Wechsel, in denen der Bonus greift (1-2 davor: neutral)
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v7_formkurve"
+MODELL_VERSION = "poisson_v8_trainerwechsel"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -320,6 +322,33 @@ def formkurve_faktoren(team_id: int, staerken: dict, form: dict) -> tuple[float,
     return 1 + delta_angriff, 1 + delta_abwehr
 
 
+def trainerwechsel_faktor(team_id: int, bis_datum: datetime) -> tuple[float, float]:
+    """
+    "Neue Besen kehren gut" -- aber verzoegert: die ersten 1-2 Spiele nach
+    einem Trainerwechsel braucht das neue Konzept Zeit, deshalb kein
+    Sofort-Bonus. Ab Spiel TRAINERWECHSEL_FENSTER[0] bis [1] seit Wechsel
+    gibt es einen kleinen Angriffs-/Abwehr-Bonus, danach ist der Trainer
+    reguraer und der Effekt steckt schon in Formkurve/Staerke.
+    """
+    res = sb.table("teams").select("trainer_seit").eq("id", team_id).single().execute().data
+    trainer_seit = res.get("trainer_seit") if res else None
+    if not trainer_seit:
+        return 1.0, 1.0
+
+    seit = datetime.fromisoformat(trainer_seit).replace(tzinfo=timezone.utc)
+    heim = sb.table("spiele").select("id", count="exact").eq("liga", "bl1") \
+        .eq("heim_team_id", team_id).gte("anstoss", seit.isoformat()) \
+        .lt("anstoss", bis_datum.isoformat()).not_.is_("tore_heim", "null").execute()
+    gast = sb.table("spiele").select("id", count="exact").eq("liga", "bl1") \
+        .eq("gast_team_id", team_id).gte("anstoss", seit.isoformat()) \
+        .lt("anstoss", bis_datum.isoformat()).not_.is_("tore_heim", "null").execute()
+    anzahl = (heim.count or 0) + (gast.count or 0)
+
+    if TRAINERWECHSEL_FENSTER[0] <= anzahl <= TRAINERWECHSEL_FENSTER[1]:
+        return 1 + TRAINERWECHSEL_GEWICHT, 1 - TRAINERWECHSEL_GEWICHT
+    return 1.0, 1.0
+
+
 def liga_konzentration(bis_datum: datetime):
     """
     Analysiert fuer jedes Team, wie viele seiner Tore/Gegentore in der
@@ -456,6 +485,13 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         angriff_gast *= fk_angriff_gast
         abwehr_heim *= fk_abwehr_heim
         abwehr_gast *= fk_abwehr_gast
+
+        tw_angriff_heim, tw_abwehr_heim = trainerwechsel_faktor(heim, jetzt)
+        tw_angriff_gast, tw_abwehr_gast = trainerwechsel_faktor(gast, jetzt)
+        angriff_heim *= tw_angriff_heim
+        angriff_gast *= tw_angriff_gast
+        abwehr_heim *= tw_abwehr_heim
+        abwehr_gast *= tw_abwehr_gast
 
         kz_angriff_heim, kz_abwehr_heim = konzentration.get(heim, (1.0, 1.0))
         kz_angriff_gast, kz_abwehr_gast = konzentration.get(gast, (1.0, 1.0))
