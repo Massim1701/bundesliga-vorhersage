@@ -4,8 +4,9 @@ on:
   schedule:
     # Ergebnisse + Marktwerte taeglich um 04:00 UTC aktualisieren
     - cron: "0 4 * * *"
-    # Aufstellungen + Vorhersage: stuendlich Fr-So (deckt die meisten Anstosszeiten ab)
-    - cron: "0 * * * 5,6,0"
+    # Aufstellungen + Vorhersage: stuendlich, jeden Tag (Bundesliga spielt bei
+    # englischen Wochen auch Di/Mi, nicht nur Fr-So)
+    - cron: "0 * * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -54,7 +55,7 @@ jobs:
         run: python scripts/model_poisson.py --tage-voraus 6
 
   spieltag_live:
-    if: github.event.schedule == '0 * * * 5,6,0'
+    if: github.event.schedule == '0 * * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
