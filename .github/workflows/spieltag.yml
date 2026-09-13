@@ -42,6 +42,12 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
         run: python scripts/fetch_aufstellungen.py --stats
+      - name: Schiedsrichter-Ansetzungen aktualisieren
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scripts/fetch_schiedsrichter.py
       - name: Vorlaeufige Aufstellung aus letztem Spiel uebernehmen
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
