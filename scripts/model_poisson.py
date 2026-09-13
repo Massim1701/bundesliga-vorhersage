@@ -61,6 +61,8 @@ PLAYER_WEIGHT = 0.06  # Abwertung Angriffs-/Abwehrstaerke je fehlendem Top-Score
 H2H_JAHRE = 5  # Betrachtungszeitraum fuer den direkten Vergleich
 H2H_GEWICHT = 0.5  # Anteil des direkten Vergleichs an der Tor-Erwartung
 KADERWERT_GEWICHT = 0.15  # Einfluss der Kaderwert-Differenz auf die Angriffsstaerke
+FORM_ANZAHL_SPIELE = 5  # "the trend is your friend": ueber wie viele juengste Spiele die Form laeuft
+FORM_GEWICHT = 0.2  # wie stark die juengste Form vom langfristigen Saison-Schnitt abweichen darf
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
@@ -142,7 +144,34 @@ def liga_kennzahlen_zeitgewichtet(bis_datum: datetime):
             "angriff": (t["tore_w"] / t["gewicht"]) / liga_avg,
             "abwehr": (t["gegentore_w"] / t["gewicht"]) / liga_avg,
         }
-    return staerken, liga_avg
+
+    # "The trend is your friend": kurzfristige Form ueber die letzten 5 Spiele
+    # je Team, unabhaengig vom Gegner. Separat von der langfristigen Staerke
+    # (die mit ~1 Jahr Halbwertszeit eher den Saisonschnitt glaettet als eine
+    # Hoch-/Tief-Phase abzubilden).
+    spiele_je_team = {}
+    for s in spiele:
+        anstoss = datetime.fromisoformat(s["anstoss"].replace("Z", "+00:00"))
+        eff_heim = s["tore_heim"] if s.get("xg_heim") is None else 0.5 * s["tore_heim"] + 0.5 * s["xg_heim"]
+        eff_gast = s["tore_gast"] if s.get("xg_gast") is None else 0.5 * s["tore_gast"] + 0.5 * s["xg_gast"]
+        for team_id, geschossen, kassiert in (
+            (s["heim_team_id"], eff_heim, eff_gast),
+            (s["gast_team_id"], eff_gast, eff_heim),
+        ):
+            spiele_je_team.setdefault(team_id, []).append((anstoss, geschossen, kassiert))
+
+    form = {}
+    for team_id, liste in spiele_je_team.items():
+        liste.sort(key=lambda x: x[0], reverse=True)
+        letzte5 = liste[:FORM_ANZAHL_SPIELE]
+        if not letzte5:
+            continue
+        form[team_id] = {
+            "angriff": sum(g for _, g, _ in letzte5) / len(letzte5) / liga_avg,
+            "abwehr": sum(k for _, _, k in letzte5) / len(letzte5) / liga_avg,
+        }
+
+    return staerken, liga_avg, form
 
 
 def tau_korrektur(x: int, y: int, lam: float, mu: float, rho: float) -> float:
@@ -272,6 +301,24 @@ def kaderwert_faktoren(heim_id: int, gast_id: int) -> tuple[float, float]:
     return 1 + delta, 1 - delta
 
 
+def formkurve_faktoren(team_id: int, staerken: dict, form: dict) -> tuple[float, float]:
+    """
+    "The trend is your friend": vergleicht die Form der letzten
+    FORM_ANZAHL_SPIELE Partien mit der langfristigen Staerke des Teams.
+    Schiesst/kassiert ein Team zuletzt spuerbar mehr oder weniger als sein
+    Saison-Schnitt, verschiebt das Angriffs- bzw. Abwehr-Staerke leicht in
+    diese Richtung -- gedeckelt durch FORM_GEWICHT, damit eine kurze Serie
+    das Bild nicht komplett kippt.
+    """
+    basis = staerken.get(team_id)
+    aktuell = form.get(team_id)
+    if not basis or not aktuell or basis["angriff"] <= 0 or basis["abwehr"] <= 0:
+        return 1.0, 1.0
+    delta_angriff = FORM_GEWICHT * (aktuell["angriff"] / basis["angriff"] - 1)
+    delta_abwehr = FORM_GEWICHT * (aktuell["abwehr"] / basis["abwehr"] - 1)
+    return 1 + delta_angriff, 1 + delta_abwehr
+
+
 def liga_konzentration(bis_datum: datetime):
     """
     Analysiert fuer jedes Team, wie viele seiner Tore/Gegentore in der
@@ -363,7 +410,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
     jetzt = datetime.now(timezone.utc)
     bis = jetzt + timedelta(days=tage_voraus)
 
-    staerken, liga_avg = liga_kennzahlen_zeitgewichtet(jetzt)
+    staerken, liga_avg, form = liga_kennzahlen_zeitgewichtet(jetzt)
     konzentration = liga_konzentration(jetzt)
 
     spiele = (
@@ -400,6 +447,13 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         kw_faktor_heim, kw_faktor_gast = kaderwert_faktoren(heim, gast)
         angriff_heim *= kw_faktor_heim
         angriff_gast *= kw_faktor_gast
+
+        fk_angriff_heim, fk_abwehr_heim = formkurve_faktoren(heim, staerken, form)
+        fk_angriff_gast, fk_abwehr_gast = formkurve_faktoren(gast, staerken, form)
+        angriff_heim *= fk_angriff_heim
+        angriff_gast *= fk_angriff_gast
+        abwehr_heim *= fk_abwehr_heim
+        abwehr_gast *= fk_abwehr_gast
 
         kz_angriff_heim, kz_abwehr_heim = konzentration.get(heim, (1.0, 1.0))
         kz_angriff_gast, kz_abwehr_gast = konzentration.get(gast, (1.0, 1.0))
