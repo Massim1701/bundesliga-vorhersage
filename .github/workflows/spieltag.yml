@@ -7,6 +7,8 @@ on:
     # Aufstellungen + Vorhersage: stuendlich, jeden Tag (Bundesliga spielt bei
     # englischen Wochen auch Di/Mi, nicht nur Fr-So)
     - cron: "0 * * * *"
+    # Sperren/Verletzungen fuer das kommende Wochenende: jeden Montag
+    - cron: "0 8 * * 1"
   workflow_dispatch: {}
 
 jobs:
@@ -85,3 +87,20 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python scripts/model_poisson.py --tage-voraus 1
+
+  woechentlicher_sperren_check:
+    if: github.event.schedule == '0 8 * * 1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Sperren fuers kommende Wochenende pruefen
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: python scripts/fetch_sperren.py
