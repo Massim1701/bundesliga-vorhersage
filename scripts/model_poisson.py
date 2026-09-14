@@ -260,6 +260,14 @@ def top_scorer_ids(team_id: int, saison: str, n: int = 3) -> set[int]:
 
 
 def fehlende_stammspieler(spiel_id: int, team_id: int, saison: str) -> int:
+    top = top_scorer_ids(team_id, saison)
+
+    gesperrt = {
+        s["spieler_id"]
+        for s in sb.table("sperren").select("spieler_id").eq("team_id", team_id).execute().data
+    }
+    fehlt = top & gesperrt  # bekannte Sperren zaehlen sofort, auch ohne bestaetigte Aufstellung
+
     aufstellung = (
         sb.table("aufstellungen")
         .select("spieler_id")
@@ -268,11 +276,11 @@ def fehlende_stammspieler(spiel_id: int, team_id: int, saison: str) -> int:
         .execute()
         .data
     )
-    if not aufstellung:
-        return 0  # noch keine Aufstellung da -> keine Abwertung moeglich
-    im_kader = {a["spieler_id"] for a in aufstellung}
-    top = top_scorer_ids(team_id, saison)
-    return len(top - im_kader)
+    if aufstellung:
+        im_kader = {a["spieler_id"] for a in aufstellung}
+        fehlt |= (top - im_kader)
+
+    return len(fehlt)
 
 
 def kaderwert(team_id: int) -> int | None:
