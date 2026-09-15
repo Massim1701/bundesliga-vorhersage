@@ -74,12 +74,13 @@ SCHIEDSRICHTER_MIN_SPIELE = 15  # ohne genug eigene Spiele keine verlaessliche A
 LIGA_HEIMSIEG_QUOTE = 0.45  # grober Bundesliga-Erfahrungswert als Vergleichsbasis
 LAUFLEISTUNG_GEWICHT = 0.08  # kleiner Fitness-Faktor: mehr Laufleistung als Liga-Schnitt = leichter Bonus
 QUOTEN_GEWICHT = 0.3  # Beimischung des bwin-Marktkonsens zur eigenen Endwahrscheinlichkeit, wo vorhanden
+STIL_GEWICHT = 0.08  # Konter- vs. Ballbesitz-Mismatch: bewusst klein, ergaenzt nur die Staerke-Basis
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v14_quoten_beimischung"
+MODELL_VERSION = "poisson_v15_spielstil"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -448,6 +449,35 @@ def laufleistung_faktor(team_id: int) -> tuple[float, float]:
     return 1 + delta, 1 - delta
 
 
+def spielstil_faktoren(heim_id: int, gast_id: int) -> tuple[float, float]:
+    """
+    Konter- vs. Ballbesitz-Mismatch: Ballkontakte pro Spiel (sportschau.de,
+    teams.ballkontakte_spiel) dient als Stil-Proxy -- viele Kontakte =
+    ballbesitzorientiert/hochstehend (anfaellig fuer Kontern und Raeume im
+    Ruecken), wenige Kontakte = tiefstehend/konterorientiert. Ist der
+    Ballbesitz-Unterschied zwischen den beiden Teams gross, bekommt die
+    Kontermannschaft einen kleinen Angriffsbonus gegen den ballbesitz-
+    staerkeren Gegner (nutzt dessen Raeume), waehrend der ballbesitzstarke
+    Gegner defensiv etwas anfaelliger wird. Ohne Werte fuer beide Teams:
+    neutral.
+    """
+    alle = sb.table("teams").select("id,ballkontakte_spiel").not_.is_("ballkontakte_spiel", "null").execute().data
+    heim_wert = next((t["ballkontakte_spiel"] for t in alle if t["id"] == heim_id), None)
+    gast_wert = next((t["ballkontakte_spiel"] for t in alle if t["id"] == gast_id), None)
+    if heim_wert is None or gast_wert is None or not alle:
+        return (1.0, 1.0), (1.0, 1.0)
+    liga_schnitt = sum(t["ballkontakte_spiel"] for t in alle) / len(alle)
+    if liga_schnitt <= 0:
+        return (1.0, 1.0), (1.0, 1.0)
+    diff = (gast_wert - heim_wert) / liga_schnitt  # positiv: Gast ballbesitzstaerker als Heim
+
+    heim_angriff_bonus = 1 + STIL_GEWICHT * math.tanh(diff)
+    heim_abwehr_malus = 1 - STIL_GEWICHT * math.tanh(diff)  # ballbesitzstaerkeres Heim wird anfaelliger
+    gast_angriff_bonus = 1 + STIL_GEWICHT * math.tanh(-diff)
+    gast_abwehr_malus = 1 - STIL_GEWICHT * math.tanh(-diff)
+    return (heim_angriff_bonus, heim_abwehr_malus), (gast_angriff_bonus, gast_abwehr_malus)
+
+
 def liga_konzentration(bis_datum: datetime):
     """
     Analysiert fuer jedes Team, wie viele seiner Tore/Gegentore in der
@@ -635,6 +665,12 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         angriff_gast *= ll_angriff_gast
         abwehr_heim *= ll_abwehr_heim
         abwehr_gast *= ll_abwehr_gast
+
+        (stil_angriff_heim, stil_abwehr_heim), (stil_angriff_gast, stil_abwehr_gast) = spielstil_faktoren(heim, gast)
+        angriff_heim *= stil_angriff_heim
+        angriff_gast *= stil_angriff_gast
+        abwehr_heim *= stil_abwehr_heim
+        abwehr_gast *= stil_abwehr_gast
 
         erw_heim = avg * angriff_heim * abwehr_gast * HEIMVORTEIL * schiedsrichter_heimvorteil_faktor(spiel.get("schiedsrichter"))
         erw_gast = avg * angriff_gast * abwehr_heim
