@@ -75,12 +75,14 @@ LIGA_HEIMSIEG_QUOTE = 0.45  # grober Bundesliga-Erfahrungswert als Vergleichsbas
 LAUFLEISTUNG_GEWICHT = 0.08  # kleiner Fitness-Faktor: mehr Laufleistung als Liga-Schnitt = leichter Bonus
 QUOTEN_GEWICHT = 0.3  # Beimischung des bwin-Marktkonsens zur eigenen Endwahrscheinlichkeit, wo vorhanden
 STIL_GEWICHT = 0.08  # Konter- vs. Ballbesitz-Mismatch: bewusst klein, ergaenzt nur die Staerke-Basis
+KNAPP_SCHWELLE_UG = 0.05  # ab welchem Abstand Unentschieden/Auswaertssieg als "knapp" gilt
+KNAPP_TIEBREAK_GEWICHT = 0.4  # wie stark gute Gast-Form in einem knappen U/A-Fall Richtung Auswaertssieg schiebt
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v15_spielstil"
+MODELL_VERSION = "poisson_v16_knapp_tiebreak"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -564,6 +566,26 @@ def matrix_vorhersage(
     return p_heim, p_unentschieden, p_gast, bestes_ergebnis
 
 
+def knapp_tiebreak_auswaerts(p_heim: float, p_x: float, p_gast: float, gast_id: int, staerken: dict, form: dict) -> tuple[float, float, float]:
+    """
+    Aus der Fehleranalyse: bei knappen Faellen zwischen Unentschieden und
+    Auswaertssieg (Abstand < KNAPP_SCHWELLE_UG) hilft die juengste Form des
+    Gastteams als Tie-Breaker -- war sie zuletzt gut bis sehr gut (Formkurve-
+    Angriffsfaktor > 1, sie schiessen/kassieren besser als ihr Saison-
+    Schnitt), ist ein Auswaertserfolg wahrscheinlicher als die reine
+    Wahrscheinlichkeit vermuten laesst. Verschiebt in diesem Fall etwas
+    Wahrscheinlichkeitsmasse von Unentschieden zu Auswaertssieg.
+    """
+    if abs(p_x - p_gast) >= KNAPP_SCHWELLE_UG:
+        return p_heim, p_x, p_gast
+    fk_angriff, fk_abwehr = formkurve_faktoren(gast_id, staerken, form)
+    form_signal = max(0.0, (fk_angriff - 1) + (1 - fk_abwehr))  # gute Form: mehr Angriff UND weniger Gegentore
+    if form_signal <= 0:
+        return p_heim, p_x, p_gast
+    verschiebung = min(KNAPP_TIEBREAK_GEWICHT * form_signal, p_x)
+    return p_heim, p_x - verschiebung, p_gast + verschiebung
+
+
 def quoten_beimischung(p_heim: float, p_x: float, p_gast: float, spiel: dict) -> tuple[float, float, float]:
     """
     Mischt, wo vorhanden, den impliziten Markt-Konsens aus den bwin-Quoten
@@ -681,6 +703,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
             erw_gast = (1 - H2H_GEWICHT) * erw_gast + H2H_GEWICHT * h2h_gast
 
         p_heim, p_x, p_gast, (tipp_h, tipp_g) = matrix_vorhersage(erw_heim, erw_gast)
+        p_heim, p_x, p_gast = knapp_tiebreak_auswaerts(p_heim, p_x, p_gast, gast, staerken, form)
         p_heim, p_x, p_gast = quoten_beimischung(p_heim, p_x, p_gast, spiel)
 
         sb.table("vorhersagen").upsert(
