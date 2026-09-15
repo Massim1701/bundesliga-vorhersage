@@ -78,7 +78,7 @@ RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v11_laufleistung"
+MODELL_VERSION = "poisson_v12_laufleistung_trend"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -427,20 +427,58 @@ def schiedsrichter_heimvorteil_faktor(schiedsrichter: str | None) -> float:
     return 1 + delta
 
 
+def _laufleistung_letzte_spiele(team_id: int) -> float | None:
+    """
+    Km/Spiel nur ueber die Partien seit der vorletzten Momentaufnahme, nicht
+    ueber die ganze Saison ("the trend is your friend" -- wie bei der
+    Formkurve fuer Tore). Braucht zwei Snapshots in laufleistung_snapshots;
+    mit nur einem Snapshot (z.B. ganz am Saisonanfang) faellt es auf den
+    kumulierten Saison-Schnitt dieses einen Snapshots zurueck.
+    """
+    snaps = (
+        sb.table("laufleistung_snapshots")
+        .select("spiele_kumuliert,km_kumuliert,abgerufen_am")
+        .eq("team_id", team_id)
+        .order("abgerufen_am", desc=True)
+        .limit(2)
+        .execute()
+        .data
+    )
+    if not snaps:
+        return None
+    if len(snaps) == 1:
+        s = snaps[0]
+        return s["km_kumuliert"] / s["spiele_kumuliert"] if s["spiele_kumuliert"] else None
+    neu, alt = snaps[0], snaps[1]
+    delta_spiele = neu["spiele_kumuliert"] - alt["spiele_kumuliert"]
+    delta_km = neu["km_kumuliert"] - alt["km_kumuliert"]
+    if delta_spiele <= 0:
+        return neu["km_kumuliert"] / neu["spiele_kumuliert"] if neu["spiele_kumuliert"] else None
+    return delta_km / delta_spiele
+
+
 def laufleistung_faktor(team_id: int) -> tuple[float, float]:
     """
-    Fitness-Proxy: Teams, die im Saisonschnitt mehr laufen als der Liga-
+    Fitness-Proxy: Teams, die zuletzt mehr gelaufen sind als der Liga-
     Durchschnitt, bekommen einen kleinen Angriffs-/Abwehr-Bonus (laufstarke
     Mannschaft = fitter gegenueber einer Mannschaft, die weniger laeuft).
-    Daten kommen von sportschau.de (teams.laufleistung_km_spiel), aktuell
-    halb-manuell gepflegt. Ohne Werte: neutral.
+    Nutzt nur die juengsten Spiele (Differenz der letzten zwei Snapshots),
+    nicht den gesamten Saison-Schnitt. Daten kommen von sportschau.de,
+    aktuell halb-manuell gepflegt. Ohne Werte: neutral.
     """
-    alle = sb.table("teams").select("id,laufleistung_km_spiel").not_.is_("laufleistung_km_spiel", "null").execute().data
-    if not alle:
+    teams_mit_wert = sb.table("teams").select("id").not_.is_("laufleistung_km_spiel", "null").execute().data
+    werte = []
+    eigener = None
+    for t in teams_mit_wert:
+        wert = _laufleistung_letzte_spiele(t["id"])
+        if wert is not None:
+            werte.append(wert)
+            if t["id"] == team_id:
+                eigener = wert
+    if not werte or eigener is None:
         return 1.0, 1.0
-    liga_schnitt = sum(t["laufleistung_km_spiel"] for t in alle) / len(alle)
-    eigener = next((t["laufleistung_km_spiel"] for t in alle if t["id"] == team_id), None)
-    if eigener is None or liga_schnitt <= 0:
+    liga_schnitt = sum(werte) / len(werte)
+    if liga_schnitt <= 0:
         return 1.0, 1.0
     delta = LAUFLEISTUNG_GEWICHT * math.tanh((eigener - liga_schnitt) / liga_schnitt)
     return 1 + delta, 1 - delta
