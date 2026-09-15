@@ -72,12 +72,13 @@ TRAINER_QUALITAET_JAHRE = 5  # Deckelung des Betrachtungszeitraums
 SCHIEDSRICHTER_GEWICHT = 0.1  # bewusst klein gehalten, generelle Tendenz nicht Team-spezifisch
 SCHIEDSRICHTER_MIN_SPIELE = 15  # ohne genug eigene Spiele keine verlaessliche Aussage
 LIGA_HEIMSIEG_QUOTE = 0.45  # grober Bundesliga-Erfahrungswert als Vergleichsbasis
+LAUFLEISTUNG_GEWICHT = 0.08  # kleiner Fitness-Faktor: mehr Laufleistung als Liga-Schnitt = leichter Bonus
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v10_schiedsrichter"
+MODELL_VERSION = "poisson_v11_laufleistung"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -426,6 +427,25 @@ def schiedsrichter_heimvorteil_faktor(schiedsrichter: str | None) -> float:
     return 1 + delta
 
 
+def laufleistung_faktor(team_id: int) -> tuple[float, float]:
+    """
+    Fitness-Proxy: Teams, die im Saisonschnitt mehr laufen als der Liga-
+    Durchschnitt, bekommen einen kleinen Angriffs-/Abwehr-Bonus (laufstarke
+    Mannschaft = fitter gegenueber einer Mannschaft, die weniger laeuft).
+    Daten kommen von sportschau.de (teams.laufleistung_km_spiel), aktuell
+    halb-manuell gepflegt. Ohne Werte: neutral.
+    """
+    alle = sb.table("teams").select("id,laufleistung_km_spiel").not_.is_("laufleistung_km_spiel", "null").execute().data
+    if not alle:
+        return 1.0, 1.0
+    liga_schnitt = sum(t["laufleistung_km_spiel"] for t in alle) / len(alle)
+    eigener = next((t["laufleistung_km_spiel"] for t in alle if t["id"] == team_id), None)
+    if eigener is None or liga_schnitt <= 0:
+        return 1.0, 1.0
+    delta = LAUFLEISTUNG_GEWICHT * math.tanh((eigener - liga_schnitt) / liga_schnitt)
+    return 1 + delta, 1 - delta
+
+
 def liga_konzentration(bis_datum: datetime):
     """
     Analysiert fuer jedes Team, wie viele seiner Tore/Gegentore in der
@@ -583,6 +603,13 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         angriff_gast *= kz_angriff_gast
         abwehr_heim *= kz_abwehr_heim
         abwehr_gast *= kz_abwehr_gast
+
+        ll_angriff_heim, ll_abwehr_heim = laufleistung_faktor(heim)
+        ll_angriff_gast, ll_abwehr_gast = laufleistung_faktor(gast)
+        angriff_heim *= ll_angriff_heim
+        angriff_gast *= ll_angriff_gast
+        abwehr_heim *= ll_abwehr_heim
+        abwehr_gast *= ll_abwehr_gast
 
         erw_heim = avg * angriff_heim * abwehr_gast * HEIMVORTEIL * schiedsrichter_heimvorteil_faktor(spiel.get("schiedsrichter"))
         erw_gast = avg * angriff_gast * abwehr_heim
