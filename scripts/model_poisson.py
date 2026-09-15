@@ -73,12 +73,13 @@ SCHIEDSRICHTER_GEWICHT = 0.1  # bewusst klein gehalten, generelle Tendenz nicht 
 SCHIEDSRICHTER_MIN_SPIELE = 15  # ohne genug eigene Spiele keine verlaessliche Aussage
 LIGA_HEIMSIEG_QUOTE = 0.45  # grober Bundesliga-Erfahrungswert als Vergleichsbasis
 LAUFLEISTUNG_GEWICHT = 0.08  # kleiner Fitness-Faktor: mehr Laufleistung als Liga-Schnitt = leichter Bonus
+QUOTEN_GEWICHT = 0.3  # Beimischung des bwin-Marktkonsens zur eigenen Endwahrscheinlichkeit, wo vorhanden
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v13_laufleistung_saison"
+MODELL_VERSION = "poisson_v14_quoten_beimischung"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -533,6 +534,29 @@ def matrix_vorhersage(
     return p_heim, p_unentschieden, p_gast, bestes_ergebnis
 
 
+def quoten_beimischung(p_heim: float, p_x: float, p_gast: float, spiel: dict) -> tuple[float, float, float]:
+    """
+    Mischt, wo vorhanden, den impliziten Markt-Konsens aus den bwin-Quoten
+    (spiele.bwin_heim/-unentschieden/-gast) zu QUOTEN_GEWICHT-Anteil in
+    unsere eigene Endwahrscheinlichkeit -- der Markt hat oft Insider-Wissen
+    (Verletzungen, interne Infos), das wir nicht haben. Bewusst nur eine
+    Beimischung, keine Ersetzung: unser Modell bleibt die Basis. Quoten
+    werden aktuell halb-manuell in die DB eingetragen. Ohne Quoten: unsere
+    eigene Berechnung bleibt unveraendert.
+    """
+    bh, bx, bg = spiel.get("bwin_heim"), spiel.get("bwin_unentschieden"), spiel.get("bwin_gast")
+    if not bh or not bx or not bg:
+        return p_heim, p_x, p_gast
+    roh_heim, roh_x, roh_gast = 1 / bh, 1 / bx, 1 / bg
+    gesamt = roh_heim + roh_x + roh_gast  # Buchmacher-Marge rausrechnen
+    markt_heim, markt_x, markt_gast = roh_heim / gesamt, roh_x / gesamt, roh_gast / gesamt
+
+    neu_heim = (1 - QUOTEN_GEWICHT) * p_heim + QUOTEN_GEWICHT * markt_heim
+    neu_x = (1 - QUOTEN_GEWICHT) * p_x + QUOTEN_GEWICHT * markt_x
+    neu_gast = (1 - QUOTEN_GEWICHT) * p_gast + QUOTEN_GEWICHT * markt_gast
+    return neu_heim, neu_x, neu_gast
+
+
 def berechne_vorhersagen(tage_voraus: int = 3):
     aktuelle_saison = str(datetime.now().year)
     jetzt = datetime.now(timezone.utc)
@@ -544,7 +568,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
 
     spiele = (
         sb.table("spiele")
-        .select("id, heim_team_id, gast_team_id, anstoss, schiedsrichter")
+        .select("id, heim_team_id, gast_team_id, anstoss, schiedsrichter, bwin_heim, bwin_unentschieden, bwin_gast")
         .gte("anstoss", sperrgrenze.isoformat())
         .lte("anstoss", bis.isoformat())
         .eq("status", "geplant")
@@ -621,6 +645,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
             erw_gast = (1 - H2H_GEWICHT) * erw_gast + H2H_GEWICHT * h2h_gast
 
         p_heim, p_x, p_gast, (tipp_h, tipp_g) = matrix_vorhersage(erw_heim, erw_gast)
+        p_heim, p_x, p_gast = quoten_beimischung(p_heim, p_x, p_gast, spiel)
 
         sb.table("vorhersagen").upsert(
             {
