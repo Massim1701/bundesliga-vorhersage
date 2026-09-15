@@ -78,12 +78,14 @@ STIL_GEWICHT = 0.08  # Konter- vs. Ballbesitz-Mismatch: bewusst klein, ergaenzt 
 KNAPP_SCHWELLE_UG = 0.05  # ab welchem Abstand Unentschieden/Auswaertssieg als "knapp" gilt
 KNAPP_TIEBREAK_GEWICHT = 0.4  # wie stark gute Gast-Form in einem knappen U/A-Fall Richtung Auswaertssieg schiebt
 EA_RATING_GEWICHT = 0.15  # Einfluss der EA-FC-Kaderbewertung (Top-11-Schnitt) auf die Angriffsstaerke
+REMIS_ZIEL_QUOTE = 0.25  # historischer Bundesliga-Schnitt (grob 22-33% je nach Aera, Mitte ~25%)
+REMIS_KALIBRIERUNG_GEWICHT = 0.25  # wie stark wir bei Remis-Unterschaetzung Richtung Zielquote nachjustieren
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v18_form_heimvorteil_staerker"
+MODELL_VERSION = "poisson_v19_remis_kalibrierung"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -608,6 +610,29 @@ def knapp_tiebreak_auswaerts(p_heim: float, p_x: float, p_gast: float, gast_id: 
     return p_heim, p_x - verschiebung, p_gast + verschiebung
 
 
+def remis_kalibrierung(p_heim: float, p_x: float, p_gast: float) -> tuple[float, float, float]:
+    """
+    Aus der Fehleranalyse: das Modell unterschaetzt Unentschieden strukturell
+    (4 von 8 Fehltipps in Spieltag 1-3 waren verpasste Remis). Die
+    historische Bundesliga-Unentschieden-Quote liegt seit 1963 bei ca.
+    22-33% je nach Aera, im Schnitt rund 25%. Liegt unsere eigene
+    Remis-Wahrscheinlichkeit darunter, wird sie ein Stueck Richtung
+    REMIS_ZIEL_QUOTE angehoben -- die Differenz wird anteilig von Heim-
+    und Auswaertssieg abgezogen (wer wahrscheinlicher gewinnt, gibt
+    anteilig mehr ab). Liegt sie schon darueber, wird nichts veraendert.
+    """
+    ziel_diff = REMIS_ZIEL_QUOTE - p_x
+    if ziel_diff <= 0:
+        return p_heim, p_x, p_gast
+    gesamt_sieg = p_heim + p_gast
+    if gesamt_sieg <= 0:
+        return p_heim, p_x, p_gast
+    verschiebung = min(REMIS_KALIBRIERUNG_GEWICHT * ziel_diff, gesamt_sieg)
+    p_heim_neu = p_heim - verschiebung * (p_heim / gesamt_sieg)
+    p_gast_neu = p_gast - verschiebung * (p_gast / gesamt_sieg)
+    return p_heim_neu, p_x + verschiebung, p_gast_neu
+
+
 def quoten_beimischung(p_heim: float, p_x: float, p_gast: float, spiel: dict) -> tuple[float, float, float]:
     """
     Mischt, wo vorhanden, den impliziten Markt-Konsens aus den bwin-Quoten
@@ -729,6 +754,7 @@ def berechne_vorhersagen(tage_voraus: int = 3):
             erw_gast = (1 - H2H_GEWICHT) * erw_gast + H2H_GEWICHT * h2h_gast
 
         p_heim, p_x, p_gast, (tipp_h, tipp_g) = matrix_vorhersage(erw_heim, erw_gast)
+        p_heim, p_x, p_gast = remis_kalibrierung(p_heim, p_x, p_gast)
         p_heim, p_x, p_gast = knapp_tiebreak_auswaerts(p_heim, p_x, p_gast, gast, staerken, form)
         p_heim, p_x, p_gast = quoten_beimischung(p_heim, p_x, p_gast, spiel)
 
