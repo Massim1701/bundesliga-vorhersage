@@ -56,13 +56,13 @@ load_dotenv()
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-HEIMVORTEIL = 1.15  # grober Faktor, spaeter aus Daten ableitbar
+HEIMVORTEIL = 1.20  # angehoben: Heimvorteil staerker gewichten
 PLAYER_WEIGHT = 0.06  # Abwertung Angriffs-/Abwehrstaerke je fehlendem Top-Scorer
 H2H_JAHRE = 5  # Betrachtungszeitraum fuer den direkten Vergleich
 H2H_GEWICHT = 0.5  # Anteil des direkten Vergleichs an der Tor-Erwartung
 KADERWERT_GEWICHT = 0.15  # Einfluss der Kaderwert-Differenz auf die Angriffsstaerke
-FORM_ANZAHL_SPIELE = 5  # "the trend is your friend": ueber wie viele juengste Spiele die Form laeuft
-FORM_GEWICHT = 0.2  # wie stark die juengste Form vom langfristigen Saison-Schnitt abweichen darf
+FORM_ANZAHL_SPIELE = 3  # umgestellt auf die letzten 3 Spieltage statt 5
+FORM_GEWICHT = 0.3  # angehoben: staerkeres Gewicht auf die juengste Form
 SPERRFRIST_MINUTEN = 30  # ab wann vor Anstoss keine neue Vorhersage mehr berechnet wird
 TRAINERWECHSEL_GEWICHT = 0.08  # kurzzeitiger Bonus im "neuer Besen"-Fenster
 TRAINERWECHSEL_FENSTER = (3, 10)  # Spiele seit Wechsel, in denen der Bonus greift (1-2 davor: neutral)
@@ -83,7 +83,7 @@ RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v17_ea_rating"
+MODELL_VERSION = "poisson_v18_form_heimvorteil_staerker"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
