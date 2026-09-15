@@ -77,12 +77,13 @@ QUOTEN_GEWICHT = 0.3  # Beimischung des bwin-Marktkonsens zur eigenen Endwahrsch
 STIL_GEWICHT = 0.08  # Konter- vs. Ballbesitz-Mismatch: bewusst klein, ergaenzt nur die Staerke-Basis
 KNAPP_SCHWELLE_UG = 0.05  # ab welchem Abstand Unentschieden/Auswaertssieg als "knapp" gilt
 KNAPP_TIEBREAK_GEWICHT = 0.4  # wie stark gute Gast-Form in einem knappen U/A-Fall Richtung Auswaertssieg schiebt
+EA_RATING_GEWICHT = 0.15  # Einfluss der EA-FC-Kaderbewertung (Top-11-Schnitt) auf die Angriffsstaerke
 XI = 0.0065 / 3.5  # Dixon-Coles Zeitgewichtung, umgerechnet auf Tage (Original: pro Halbwoche)
 RHO = -0.13  # Dixon-Coles Tau-Korrektur fuer knappe Ergebnisse (Literaturwert)
 STAERKE_JAHRE = 3  # wie weit zurueck ueberhaupt Spiele geladen werden, bevor XI sie ausblendet
 SPAETPHASE_MINUTE = 75  # ab dieser Minute gilt ein Tor als "spaet" (Konzentration/Fitness-Signal)
 KONZENTRATION_GEWICHT = 1.0  # Einfluss der Spaetphasen-Schwaeche auf Angriff/Abwehr
-MODELL_VERSION = "poisson_v16_knapp_tiebreak"
+MODELL_VERSION = "poisson_v17_ea_rating"
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -320,6 +321,27 @@ def kaderwert_faktoren(heim_id: int, gast_id: int) -> tuple[float, float]:
         return 1.0, 1.0
     verhaeltnis = math.log(mw_heim / mw_gast)
     delta = KADERWERT_GEWICHT * math.tanh(verhaeltnis / 2)
+    return 1 + delta, 1 - delta
+
+
+def ea_rating_faktoren(heim_id: int, gast_id: int) -> tuple[float, float]:
+    """
+    EA-Sports-FC-Kaderbewertung (Top-11-Spielerschnitt, teams.ea_rating) als
+    zusaetzliches Staerke-Signal -- unabhaengig vom Transfermarkt-Kaderwert
+    in Euro, da EA staerker auf spielerische Faehigkeiten und weniger auf
+    Marktwert/Alter/Vertragslaufzeit abstellt. Rueckblende ueber Spieltag
+    1-3 zeigte: 57% der Spiele gehen an das hoeher bewertete Team, 24% sind
+    klare Ueberraschungen des niedriger bewerteten -- also ein echtes,
+    aber alles andere als deterministisches Signal. Logarithmisch gedaempft
+    wie beim Kaderwert, damit ein grosser Rating-Abstand die Vorhersage
+    nicht komplett dominiert.
+    """
+    res = sb.table("teams").select("id,ea_rating").in_("id", [heim_id, gast_id]).execute().data
+    werte = {r["id"]: r["ea_rating"] for r in res if r.get("ea_rating")}
+    if heim_id not in werte or gast_id not in werte:
+        return 1.0, 1.0
+    verhaeltnis = math.log(werte[heim_id] / werte[gast_id])
+    delta = EA_RATING_GEWICHT * math.tanh(verhaeltnis * 5)
     return 1 + delta, 1 - delta
 
 
@@ -652,6 +674,10 @@ def berechne_vorhersagen(tage_voraus: int = 3):
         kw_faktor_heim, kw_faktor_gast = kaderwert_faktoren(heim, gast)
         angriff_heim *= kw_faktor_heim
         angriff_gast *= kw_faktor_gast
+
+        ea_faktor_heim, ea_faktor_gast = ea_rating_faktoren(heim, gast)
+        angriff_heim *= ea_faktor_heim
+        angriff_gast *= ea_faktor_gast
 
         fk_angriff_heim, fk_abwehr_heim = formkurve_faktoren(heim, staerken, form)
         fk_angriff_gast, fk_abwehr_gast = formkurve_faktoren(gast, staerken, form)
